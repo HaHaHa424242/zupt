@@ -1,0 +1,213 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.spatial.transform import Rotation as R
+from scipy.ndimage import label
+
+# 設定繪圖字體
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'sans-serif']
+plt.rcParams['axes.unicode_minus'] = False 
+
+# =============================================================================
+# 🎛️ CONFIG: 最終黃金參數
+# =============================================================================
+CONFIG = {
+    # [檔案]
+    "STATIC_FILE": "20251224-0HSFoot.csv",
+    "WALK_FILE":   "20251224-2HSFoot.csv",
+
+    # [關鍵參數]
+    "GLRT_WINDOW": 3,        # [修正] 改為 3 (原本 5)。讓反應更快，能抓到 25Hz 下的短暫停頓，解決步數合併問題。
+    "GLRT_THRESHOLD": 400,   # 門檻維持 400 (最穩定的甜蜜點)。
+    "BETA": 0.03,            # 姿態信任係數 0.03 (抵抗震動)。
+    "ACTIVE_SPEED": 0.005,   # 極限放寬時間判定，盡量抓到頭尾的微小移動。
+
+    # [雜訊參數]
+    "SIGMA_A": 0.05,
+    "SIGMA_G": 0.05,
+}
+# =============================================================================
+
+# --- 核心類別 ---
+class Madgwick:
+    def __init__(self, frequency=100.0, beta=0.1, q0=[1.0, 0.0, 0.0, 0.0]):
+        self.samplePeriod = 1.0 / frequency
+        self.beta = beta
+        self.q = np.array(q0, dtype=float)
+
+    def updateIMU(self, q, gyr, acc):
+        q = np.array(q)
+        g = np.array(gyr)
+        a = np.array(acc)
+        norm = np.linalg.norm(a)
+        if norm == 0: return q
+        a /= norm
+        f = np.array([
+            2*(q[1]*q[3] - q[0]*q[2]) - a[0],
+            2*(q[0]*q[1] + q[2]*q[3]) - a[1],
+            2*(0.5 - q[1]**2 - q[2]**2) - a[2]
+        ])
+        J = np.array([
+            [-2*q[2], 2*q[3], -2*q[0], 2*q[1]],
+            [2*q[1], 2*q[0], 2*q[3], 2*q[2]],
+            [0, -4*q[1], -4*q[2], 0]
+        ])
+        step = J.T @ f
+        step /= np.linalg.norm(step)
+        qDot = 0.5 * np.array([
+            -q[1]*g[0] - q[2]*g[1] - q[3]*g[2],
+            q[0]*g[0] + q[2]*g[2] - q[3]*g[1],
+            q[0]*g[1] - q[1]*g[2] + q[3]*g[0],
+            q[0]*g[2] + q[1]*g[1] - q[2]*g[0]
+        ])
+        qDot -= self.beta * step
+        q += qDot * self.samplePeriod
+        q /= np.linalg.norm(q)
+        return q
+
+def acc2q(acc):
+    a = np.array(acc)
+    norm = np.linalg.norm(a)
+    if norm == 0: return np.array([1., 0., 0., 0.])
+    a /= norm
+    u = np.array([0,0,1])
+    v = a
+    if np.allclose(u, v): return np.array([1.,0.,0.,0.])
+    if np.allclose(u, -v): return np.array([0.,1.,0.,0.]) 
+    half = u + v
+    half /= np.linalg.norm(half)
+    w = np.dot(u, half)
+    xyz = np.cross(u, half)
+    return np.array([w, xyz[0], xyz[1], xyz[2]])
+
+def compute_glrt(acc, gyr, window_size=5, sigma_a=0.05, sigma_g=0.05):
+    g_val = 9.81
+    acc_mag = np.linalg.norm(acc, axis=1)
+    acc_term = (acc_mag - g_val)**2 / (sigma_a**2)
+    gyr_term = np.sum(gyr**2, axis=1) / (sigma_g**2)
+    metric = acc_term + gyr_term
+    # 使用指定的 Window Size
+    return pd.Series(metric).rolling(window_size, center=True).mean().fillna(0).values
+
+# --- 處理函式 ---
+def analyze_static_file(static_file):
+    print(f"🔹 Step 1: 分析靜止校正檔 [{static_file}]...")
+    df = pd.read_csv(static_file, header=1)
+    df.columns = ["time", "ax_r", "ay_r", "az_r", "wx_r", "wy_r", "wz_r", "ax_l", "ay_l", "az_l", "wx_l", "wy_l", "wz_l", "lumbar"]
+    gyr = df[["wx_r", "wy_r", "wz_r"]].to_numpy()
+    gyro_bias = np.mean(gyr, axis=0)
+    print(f"   >>> Gyro Bias: {gyro_bias}")
+    return gyro_bias
+
+def process_walking_file(walk_file, gyro_bias):
+    print(f"🔹 Step 2: 處理走路數據檔 [{walk_file}]...")
+    df = pd.read_csv(walk_file, header=1)
+    df.columns = ["time", "ax_r", "ay_r", "az_r", "wx_r", "wy_r", "wz_r", "ax_l", "ay_l", "az_l", "wx_l", "wy_l", "wz_l", "lumbar"]
+    df = df.astype(float)
+    df["time"] -= df["time"].iloc[0]
+    
+    # 頻率偵測
+    dt_seq = np.diff(df["time"])
+    dt_median = np.median(dt_seq)
+    fs_walk = round(1.0 / dt_median)
+    print(f"   >>> 採樣率: {fs_walk} Hz")
+    
+    acc = df[["ax_r", "ay_r", "az_r"]].to_numpy()
+    gyr = df[["wx_r", "wy_r", "wz_r"]].to_numpy()
+    gyr -= gyro_bias 
+    
+    # 姿態初始化
+    calib_samples = int(fs_walk * 2.0)
+    if calib_samples > len(df)//4: calib_samples = 20
+    acc_init = acc[:calib_samples]
+    q0 = acc2q(np.mean(acc_init, axis=0))
+    
+    # GLRT & ZUPT
+    # 使用 CONFIG 的 Window Size (3)
+    glrt_scores = compute_glrt(acc, gyr, window_size=CONFIG["GLRT_WINDOW"], sigma_a=CONFIG["SIGMA_A"], sigma_g=CONFIG["SIGMA_G"])
+    zupt_mask = glrt_scores < CONFIG["GLRT_THRESHOLD"]
+    
+    # 算一下有幾個 ZUPT 區塊 (檢查是不是 7 個)
+    labeled_array, num_features = label(zupt_mask)
+    print(f"   >>> 偵測到的 ZUPT 區塊數 (含頭尾): {num_features} (預期應為 7)")
+
+    # 積分
+    madgwick = Madgwick(frequency=fs_walk, beta=CONFIG["BETA"], q0=q0)
+    Q = np.zeros((len(df), 4))
+    Q[0] = q0
+    velocity = np.zeros((len(df), 3))
+    acc_world = np.zeros((len(df), 3))
+    dt_array = np.diff(df["time"], prepend=df["time"].iloc[0])
+    dt_array = np.where(dt_array > 0.1, dt_median, dt_array)
+    
+    last_zupt_end = 0
+    for i in range(1, len(df)):
+        Q[i] = madgwick.updateIMU(Q[i-1], gyr[i], acc[i])
+        r = R.from_quat([Q[i][1], Q[i][2], Q[i][3], Q[i][0]])
+        acc_n = r.apply(acc[i])
+        acc_n[2] -= 9.81
+        acc_world[i] = acc_n
+        
+        velocity[i] = velocity[i-1] + acc_n * dt_array[i]
+        
+        if zupt_mask[i]:
+            if not zupt_mask[i-1]:
+                step_duration = df["time"].iloc[i] - df["time"].iloc[last_zupt_end]
+                if step_duration > 0.1:
+                    drift_rate = velocity[i] / step_duration
+                    for k in range(last_zupt_end, i+1):
+                        t_k = df["time"].iloc[k] - df["time"].iloc[last_zupt_end]
+                        velocity[k] -= drift_rate * t_k
+            velocity[i] = 0
+        else:
+            if zupt_mask[i-1]:
+                last_zupt_end = i
+
+    # 結果
+    v_horiz = np.sqrt(velocity[:, 0]**2 + velocity[:, 1]**2)
+    dist = np.sum(v_horiz * dt_array)
+    
+    is_moving = v_horiz > CONFIG["ACTIVE_SPEED"]
+    # 稍微平滑一下移動判定，避免被瞬間雜訊切斷
+    is_moving = pd.Series(is_moving).rolling(5, center=True).max().fillna(0).astype(bool).values
+    active_duration = np.sum(is_moving) * dt_median
+    active_speed = dist / active_duration if active_duration > 0 else 0
+    
+    print("-" * 30)
+    print(f"📍 總位移 (Distance) : {dist:.3f} m")
+    print(f"🚀 行進均速 (Speed)   : {active_speed:.3f} m/s")
+    print(f"⏱️ 移動時間 (Time)    : {active_duration:.2f} s")
+    print("-" * 30)
+    
+    # 繪圖
+    fig, axs = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
+    
+    # 速度與 ZUPT 區塊
+    axs[0].plot(df["time"], v_horiz, label="Speed", color='tab:blue')
+    axs[0].fill_between(df["time"], 0, np.max(v_horiz), where=zupt_mask, color='green', alpha=0.3, label=f"ZUPT ({num_features} blocks)")
+    axs[0].set_title(f"Speed Estimate (Dist: {dist:.2f}m | Steps: {num_features-1}?)")
+    axs[0].legend()
+    axs[0].grid()
+    
+    # 垂直加速度
+    axs[1].plot(df["time"], acc_world[:, 2], color='tab:orange', label="Acc Z (World)")
+    axs[1].set_title("Vertical Acc")
+    axs[1].grid()
+    
+    # GLRT
+    axs[2].semilogy(df["time"], glrt_scores, color='tab:purple', label="GLRT Score")
+    axs[2].axhline(CONFIG["GLRT_THRESHOLD"], color='blue', linestyle='--', label="Threshold")
+    axs[2].set_title(f"GLRT Detector (Window={CONFIG['GLRT_WINDOW']})")
+    axs[2].grid()
+    
+    plt.tight_layout()
+    plt.show()
+
+# --- 執行 ---
+try:
+    bias = analyze_static_file(CONFIG["STATIC_FILE"])
+    process_walking_file(CONFIG["WALK_FILE"], bias)
+except FileNotFoundError:
+    print("❌ 找不到檔案")
+except Exception as e:
+    print(f"❌ 發生錯誤: {e}")
